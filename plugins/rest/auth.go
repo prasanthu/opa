@@ -28,8 +28,6 @@ import (
 	"strings"
 	"time"
 
-	awsConfig "github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/kms"
 	"github.com/aws/aws-sdk-go-v2/service/kms/types"
 	"github.com/open-policy-agent/opa/internal/jwx/jwa"
 	"github.com/open-policy-agent/opa/internal/jwx/jws"
@@ -293,7 +291,8 @@ type oauth2ClientCredentialsAuthPlugin struct {
 	Scopes               []string               `json:"scopes,omitempty"`
 	AdditionalHeaders    map[string]string      `json:"additional_headers,omitempty"`
 	AdditionalParameters map[string]string      `json:"additional_parameters,omitempty"`
-	SigningKmsKey        *kmsKeyConfig          `json:"signing_kms_key,omitempty"`
+	AWSKmsKey            *kmsKeyConfig          `json:"aws_kms_key,omitempty"`
+	AWSSigningPlugin     *awsSigningAuthPlugin  `json:"aws_signing,omitempty"`
 
 	signingKey       *keys.Config
 	signingKeyParsed interface{}
@@ -349,7 +348,7 @@ func (ap *oauth2ClientCredentialsAuthPlugin) createAuthJWT(ctx context.Context, 
 		jwsHeaders = []byte(fmt.Sprintf(`{"typ":"JWT","alg":"%s"}`, ap.signingKey.Algorithm))
 	}
 	var jwsCompact []byte
-	if ap.SigningKmsKey == nil {
+	if ap.AWSKmsKey == nil {
 		jwsCompact, err = jws.SignLiteral(payload,
 			jwa.SignatureAlgorithm(ap.signingKey.Algorithm),
 			signingKey,
@@ -369,12 +368,6 @@ func (ap *oauth2ClientCredentialsAuthPlugin) createAuthJWT(ctx context.Context, 
 // SignWithKMS will sign the JWT in AWS using the key stored in the supplied kmsArn
 func (ap *oauth2ClientCredentialsAuthPlugin) SignWithKMS(ctx context.Context, payload []byte, hdrBuf []byte) ([]byte, error) {
 
-	awsCfg, err := awsConfig.LoadDefaultConfig(ctx)
-	if err != nil {
-		return nil, err
-	}
-	kmsClient := kms.NewFromConfig(awsCfg)
-
 	encodedHdr := base64.RawURLEncoding.EncodeToString(hdrBuf)
 	encodedPayload := base64.RawURLEncoding.EncodeToString(payload)
 	input := strings.Join(
@@ -383,35 +376,29 @@ func (ap *oauth2ClientCredentialsAuthPlugin) SignWithKMS(ctx context.Context, pa
 			encodedPayload,
 		}, ".",
 	)
-	signingAlgorithm, err := mapSignAlgToKMS(ap.SigningKmsKey.Algorithm)
+	digest, err := messageDigest([]byte(input), ap.AWSKmsKey.Algorithm)
 	if err != nil {
 		return nil, err
 	}
-	const messageType = "DIGEST"
-	digest, err := messageDigest([]byte(input), ap.SigningKmsKey.Algorithm)
-	if err != nil {
-		return nil, err
-	}
-	signingInput := &kms.SignInput{
-		KeyId:            &ap.SigningKmsKey.Name,
-		Message:          digest,
-		MessageType:      messageType,
-		SigningAlgorithm: signingAlgorithm,
-	}
-	signature, sigErr := kmsClient.Sign(ctx, signingInput)
-	if sigErr != nil {
-		msg := fmt.Sprintf("failed to sign the assertion with kms key. %v", sigErr)
-		return nil, errors.New(msg)
-	}
+	if ap.AWSSigningPlugin != nil {
+		signature, err := ap.AWSSigningPlugin.SignDigest(ctx, digest, ap.AWSKmsKey.Name, ap.AWSKmsKey.Algorithm)
+		if err != nil {
+			return nil, err
+		}
+		der, err := base64.StdEncoding.DecodeString(signature)
+		if err != nil {
+			return nil, err
+		}
+		signatureData, err := converSignatureToBase64(ap.AWSKmsKey.Algorithm, der)
+		if err != nil {
+			return nil, err
+		}
 
-	signatureData, err := converSignatureToBase64(ap.SigningKmsKey.Algorithm, signature.Signature)
-	if err != nil {
-		return nil, err
+		signedAssertion := input + "." + signatureData
+
+		return []byte(signedAssertion), nil
 	}
-
-	signedAssertion := input + "." + signatureData
-
-	return []byte(signedAssertion), nil
+	return nil, errors.New("missing AWS credentials, failed to sign the assertion with kms.")
 }
 
 func (ap *oauth2ClientCredentialsAuthPlugin) parseSigningKey(c Config) (err error) {
@@ -465,15 +452,21 @@ func (ap *oauth2ClientCredentialsAuthPlugin) NewClient(c Config) (*http.Client, 
 		return nil, errors.New("token_url required to use https scheme")
 	}
 	if ap.GrantType == grantTypeClientCredentials {
-		if ap.SigningKmsKey != nil && (ap.ClientSecret != "" || ap.SigningKeyID != "") ||
+		if ap.AWSKmsKey != nil && (ap.ClientSecret != "" || ap.SigningKeyID != "") ||
 			(ap.ClientSecret != "" && ap.SigningKeyID != "") {
 			return nil, errors.New("can only use one of client_secret, signing_key or signing_kms_key for client_credentials")
 		}
-		if ap.SigningKeyID == "" && ap.SigningKmsKey == nil && (ap.ClientID == "" || ap.ClientSecret == "") {
+		if ap.SigningKeyID == "" && ap.AWSKmsKey == nil && (ap.ClientID == "" || ap.ClientSecret == "") {
 			return nil, errors.New("client_id and client_secret required")
 		}
 	}
-
+	if ap.AWSSigningPlugin != nil && ap.AWSKmsKey != nil {
+		// initialize the awsSigningAuthPlugin
+		_, err = ap.AWSSigningPlugin.NewClient(c)
+		if err != nil {
+			return nil, err
+		}
+	}
 	return DefaultRoundTripperClient(t, *c.ResponseHeaderTimeoutSeconds), nil
 }
 
@@ -700,6 +693,7 @@ type awsSigningAuthPlugin struct {
 	AWSSignatureVersion string `json:"signature_version,omitempty"`
 
 	ecrAuthPlugin *ecrAuthPlugin
+	kmsSignPlugin *awsKMSSignPlugin
 
 	logger logging.Logger
 }
@@ -844,6 +838,10 @@ func (ap *awsSigningAuthPlugin) validateAndSetDefaults(serviceType string) error
 		if ap.AWSService == "ecr" {
 			return errors.New(`aws service "ecr" must be used with service type "oci"`)
 		}
+		if ap.AWSService == "kms" {
+			// We need a special plugin for KMS.
+			ap.kmsSignPlugin = newKMSSignPlugin(ap)
+		}
 		if ap.AWSService == "" {
 			ap.AWSService = awsSigv4SigningDefaultService
 		}
@@ -854,4 +852,13 @@ func (ap *awsSigningAuthPlugin) validateAndSetDefaults(serviceType string) error
 	}
 
 	return nil
+}
+
+func (ap *awsSigningAuthPlugin) SignDigest(ctx context.Context, digest []byte, keyId string, signingAlgorithm string) (string, error) {
+	switch ap.AWSService {
+	case "kms":
+		return ap.kmsSignPlugin.SignDigest(ctx, digest, keyId, signingAlgorithm)
+	default:
+		return "", fmt.Errorf(`cannot use SignDigest with aws service %q`, ap.AWSService)
+	}
 }
