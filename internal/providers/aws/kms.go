@@ -17,6 +17,7 @@ import (
 // https://docs.aws.amazon.com/kms/latest/APIReference/Welcome.html
 // https://docs.aws.amazon.com/general/latest/gr/kms.html
 const (
+	kmsSignTarget  = "TrentService.Sign"
 	kmsEndpointFmt = "https://kms.%s.amazonaws.com/"
 )
 
@@ -43,11 +44,11 @@ func NewKMS(logger logging.Logger) *KMS {
 }
 
 type KMSSignRequest struct {
-	GrantTokens      []string `json:"GrantTokens"`
-	KeyId            string   `json:"KeyId"`
-	Message          string   `json:"Message"`
-	MessageType      string   `json:"MessageType"`
-	SigningAlgorithm string   `json:"SigningAlgorithm"`
+	//GrantTokens      []string `json:"GrantTokens"`
+	KeyId            string `json:"KeyId"`
+	Message          string `json:"Message"`
+	MessageType      string `json:"MessageType"`
+	SigningAlgorithm string `json:"SigningAlgorithm"`
 }
 type KMSSignResponse struct {
 	KeyId            string `json:"KeyId"`
@@ -61,7 +62,7 @@ func (k *KMS) SignDigest(ctx context.Context, digest []byte, keyId string, signi
 
 	kmsRequest := KMSSignRequest{
 		KeyId:            keyId,
-		Message:          base64.RawURLEncoding.EncodeToString(digest),
+		Message:          base64.StdEncoding.EncodeToString(digest),
 		MessageType:      "DIGEST",
 		SigningAlgorithm: signingAlgorithm,
 	}
@@ -75,12 +76,10 @@ func (k *KMS) SignDigest(ctx context.Context, digest []byte, keyId string, signi
 		return "", fmt.Errorf("failed to create request: %w", err)
 	}
 
-	req.Header.Set("X-Amz-Target", ecrGetAuthorizationTokenTarget)
+	req.Header.Set("X-Amz-Target", kmsSignTarget)
 	req.Header.Set("Accept-Encoding", "identity")
 	req.Header.Set("Content-Type", "application/x-amz-json-1.1")
 	req.Header.Set("User-Agent", version.UserAgent)
-
-	k.logger.Debug("Signing KMS-sign request")
 
 	if err := SignRequest(req, "kms", creds, time.Now(), signatureVersion); err != nil {
 		return "", fmt.Errorf("failed to sign request: %w", err)

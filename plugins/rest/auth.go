@@ -28,7 +28,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/service/kms/types"
 	"github.com/open-policy-agent/opa/internal/jwx/jwa"
 	"github.com/open-policy-agent/opa/internal/jwx/jws"
 	"github.com/open-policy-agent/opa/internal/jwx/jws/sign"
@@ -180,19 +179,6 @@ type kmsKeyConfig struct {
 	Algorithm string `json:"algorithm"`
 }
 
-func mapSignAlgToKMS(alg string) (types.SigningAlgorithmSpec, error) {
-	switch alg {
-	case "ES256":
-		return types.SigningAlgorithmSpecEcdsaSha256, nil
-	case "ES384":
-		return types.SigningAlgorithmSpecEcdsaSha384, nil
-	case "ES512":
-		return types.SigningAlgorithmSpecEcdsaSha512, nil
-	default:
-		return "", fmt.Errorf("unsupported sign algorithm %s", alg)
-	}
-}
-
 func converSignatureToBase64(alg string, der []byte) (string, error) {
 	r, s, derErr := pointsFromDER(der)
 	if derErr != nil {
@@ -247,11 +233,11 @@ func convertPointsToBase64(alg string, r, s []byte) (string, error) {
 func retrieveCurveBits(alg string) (int, error) {
 	var curveBits int
 	switch alg {
-	case "ES256":
+	case "ECDSA_SHA_256":
 		curveBits = 256
-	case "ES384":
+	case "ECDSA_SHA_384":
 		curveBits = 384
-	case "ES512":
+	case "ECDSA_SHA_512":
 		curveBits = 512
 	default:
 		return 0, fmt.Errorf("unsupported sign algorithm %s", alg)
@@ -263,11 +249,11 @@ func messageDigest(message []byte, alg string) ([]byte, error) {
 	var digest hash.Hash
 
 	switch alg {
-	case "ES256":
+	case "ECDSA_SHA_256":
 		digest = sha256.New()
-	case "ES384":
+	case "ECDSA_SHA_384":
 		digest = sha512.New384()
-	case "ES512":
+	case "ECDSA_SHA_512":
 		digest = sha512.New()
 	default:
 		return []byte{}, fmt.Errorf("unsupported sign algorithm %s", alg)
@@ -337,20 +323,29 @@ func (ap *oauth2ClientCredentialsAuthPlugin) createAuthJWT(ctx context.Context, 
 	}
 
 	var jwsHeaders []byte
+	var signatureAlg string
+	if ap.AWSKmsKey == nil {
+		signatureAlg = ap.signingKey.Algorithm
+	} else {
+		signatureAlg, err = ap.mapKMSAlgToSign(ap.AWSKmsKey.Algorithm)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if ap.Thumbprint != "" {
 		bytes, err := hex.DecodeString(ap.Thumbprint)
 		if err != nil {
 			return nil, err
 		}
 		x5t := base64.URLEncoding.EncodeToString(bytes)
-		jwsHeaders = []byte(fmt.Sprintf(`{"typ":"JWT","alg":"%s","x5t":"%s"}`, ap.signingKey.Algorithm, x5t))
+		jwsHeaders = []byte(fmt.Sprintf(`{"typ":"JWT","alg":"%s","x5t":"%s"}`, signatureAlg, x5t))
 	} else {
-		jwsHeaders = []byte(fmt.Sprintf(`{"typ":"JWT","alg":"%s"}`, ap.signingKey.Algorithm))
+		jwsHeaders = []byte(fmt.Sprintf(`{"typ":"JWT","alg":"%s"}`, signatureAlg))
 	}
 	var jwsCompact []byte
 	if ap.AWSKmsKey == nil {
 		jwsCompact, err = jws.SignLiteral(payload,
-			jwa.SignatureAlgorithm(ap.signingKey.Algorithm),
+			jwa.SignatureAlgorithm(signatureAlg),
 			signingKey,
 			jwsHeaders,
 			rand.Reader)
@@ -361,8 +356,21 @@ func (ap *oauth2ClientCredentialsAuthPlugin) createAuthJWT(ctx context.Context, 
 		return nil, err
 	}
 	jwt := string(jwsCompact)
-
+	ap.logger.Debug("JWT = %s", jwt)
 	return &jwt, nil
+}
+
+func (ap *oauth2ClientCredentialsAuthPlugin) mapKMSAlgToSign(alg string) (string, error) {
+	switch alg {
+	case "ECDSA_SHA_256":
+		return "ES256", nil
+	case "ECDSA_SHA_384":
+		return "ES384", nil
+	case "ECDSA_SHA_512":
+		return "ES512", nil
+	default:
+		return "", fmt.Errorf("unsupported sign algorithm %s", alg)
+	}
 }
 
 // SignWithKMS will sign the JWT in AWS using the key stored in the supplied kmsArn
@@ -486,7 +494,7 @@ func (ap *oauth2ClientCredentialsAuthPlugin) requestToken(ctx context.Context) (
 	} else {
 		body.Add("grant_type", grantTypeClientCredentials)
 
-		if ap.SigningKeyID != "" {
+		if ap.SigningKeyID != "" || ap.AWSKmsKey != nil {
 			authJwt, err := ap.createAuthJWT(ctx, ap.Claims, ap.signingKeyParsed)
 			if err != nil {
 				return nil, err
@@ -507,7 +515,7 @@ func (ap *oauth2ClientCredentialsAuthPlugin) requestToken(ctx context.Context) (
 	for k, v := range ap.AdditionalParameters {
 		body.Set(k, v)
 	}
-
+	ap.logger.Debug("Request body %s", body.Encode())
 	r, err := http.NewRequestWithContext(ctx, "POST", ap.TokenURL, strings.NewReader(body.Encode()))
 	if err != nil {
 		return nil, err
